@@ -13,23 +13,39 @@ def softcap(x:Tensor, cap:float) -> Tensor: return (x / cap).tanh() * cap
 
 # ***** quantized experts *****
 
+# small floats are decoded by moving their bits into a float32 and rebiasing the exponent with integer math, subnormal codes are exact too
+# NOTE: rescaling with a large float constant instead is wrong, tinygrad folds it with other constants and (x*2**120)*2**10 overflows to inf
+def bits_to_float(bits:Tensor) -> Tensor: return bits.cast(dtypes.uint32).bitcast(dtypes.float)
 def e2m1(c:Tensor) -> Tensor:
-  # 4 bit float: sign, 2 exponent bits, 1 mantissa bit. 4*|value| is m*2 for e == 0 and (2+m)<<(e-1) otherwise
-  e, m = (c >> 1) & 3, c & 1
-  mag = (e == 0).where(m * 2, (m + 2) * (e == 3).where(8, (e == 2).where(4, 2)))
-  return (c >= 8).where(-0.25, 0.25) * mag.cast(dtypes.float)
+  normal = bits_to_float(((c & 0x8) << 28) | (((c & 0x7) << 22) + (126 << 23)))
+  return ((c & 0x6) == 0).where((c & 0x8 != 0).where(-0.5, 0.5) * (c & 1).cast(dtypes.float), normal)
+def fp8e4m3(b:Tensor) -> Tensor:
+  normal = bits_to_float(((b & 0x80) << 24) | (((b & 0x7F) << 20) + (120 << 23)))
+  return ((b & 0x78) == 0).where((b & 0x80 != 0).where(-2.0**-9, 2.0**-9) * (b & 0x7).cast(dtypes.float), normal)
+
+def to_cols_rows(t:Tensor) -> Tensor:
+  """(experts, rows, cols) bytes -> (experts, cols, rows/4) uint32, so the threads computing adjacent rows load adjacent bytes"""
+  return t.bitcast(dtypes.uint8).permute(0, 2, 1).contiguous().bitcast(dtypes.uint32).contiguous()
+
+def unpack_bytes(w:Tensor) -> Tensor: return Tensor.stack(*[(w >> (8*j)) & 0xFF for j in range(4)], dim=-1).reshape(*w.shape[:-1], -1).cast(dtypes.int32)
 
 def dequant(q:dict[str, Tensor], sel:Tensor) -> Tensor:
-  """returns the float (len(sel), rows, cols) weights of experts sel"""
-  w = q["w"][sel]
+  """returns the float (len(sel), cols, rows) transposed weights of experts sel"""
+  if "s" not in q: return q["w"][sel].float()  # unquantized
+  b = unpack_bytes(q["w"][sel])
+  n, R = b.shape[0], b.shape[-1]
   if "f" in q:  # NVFP4: two e2m1 per byte (even column in the low nibble), an fp8e4m3 scale per 16 values, a scale per expert
-    b = w.cast(dtypes.int32)
-    w = Tensor.stack(e2m1(b & 0xF), e2m1(b >> 4), dim=-1).reshape(*w.shape[:-1], -1)
-    s = q["s"][sel].cast(dtypes.float) * q["f"][sel].reshape(-1, 1, 1)
-  elif "s" in q:  # MXFP8: fp8e4m3 values, an e8m0 scale (2**(s-127)) per 32 values
-    s = (q["s"][sel].cast(dtypes.uint32) << 23).bitcast(dtypes.float)
-  else: return w.cast(dtypes.float)  # unquantized
-  return (w.cast(dtypes.float).reshape(*s.shape, -1) * s.unsqueeze(-1)).reshape(w.shape)
+    w = Tensor.stack(e2m1(b & 0xF), e2m1(b >> 4), dim=2).reshape(n, -1, R)
+    s = fp8e4m3(unpack_bytes(q["s"][sel])) * q["f"][sel].reshape(-1, 1, 1)
+  else:  # MXFP8: fp8e4m3 values, an e8m0 scale (2**(s-127)) per 32 values
+    w, s = fp8e4m3(b), bits_to_float(unpack_bytes(q["s"][sel]) << 23)
+  return (w.reshape(n, s.shape[1], -1, R) * s.unsqueeze(2)).reshape(n, -1, R)
+
+def matvec(x:Tensor, w:Tensor, split:bool) -> Tensor:
+  """x (n, C) times w (n, C, R). with split, the reduction is done in chunks of 48 first so a single token has enough parallelism"""
+  n, C, R = w.shape
+  if not split or C % 48: return (x.unsqueeze(1) @ w).reshape(n, R)
+  return (x.reshape(n, C // 48, 48, 1) * w.reshape(n, C // 48, 48, R)).sum(2).contiguous().sum(1)
 
 # ***** model *****
 
@@ -47,7 +63,9 @@ class Inkling2:
         q = {"w": weights.pop(p)}
         if (s:=weights.pop(p+"_scale", None)) is not None: q["s"] = s
         if (amax:=weights.pop(p+"_amax", None)) is not None:
-          q["f"] = (amax.float() / weights.pop(p+"_outer_scale_denominator").float()).contiguous()
+          q["f"] = (amax.float() / weights.pop(p+"_outer_scale_denominator").float()).contiguous().realize()
+        if "s" in q: q["w"], q["s"] = to_cols_rows(q["w"]).realize(), to_cols_rows(q["s"]).realize()
+        else: q["w"] = q["w"].permute(0, 2, 1).contiguous().realize()
         self.experts[(i, name)] = q
     n_loop = self.loop_end - self.loop_start
     qs, kvs = (weights[f"model.llm.middle_cycle_cross_pass_{n}"].float().reshape(n_loop, 2, self.H) for n in ("queries", "kv_queries"))
@@ -93,6 +111,8 @@ class Inkling2:
     # full attention layers scale queries and relative states by 1 + alpha * log(max((pos+1) / n_floor, 1))
     tau = (1 + cfg["log_scaling_alpha"] * ((pos + 1).float() / cfg["log_scaling_n_floor"]).maximum(1.0).log()).reshape(T, 1, 1) if full else 1.0
 
+    # contiguous marks the intermediates that would otherwise be recomputed inside the attention reductions
+    xq, xk, xv = xq.contiguous(), xk.contiguous(), xv.contiguous()
     q = l2clip((xq @ self.w(p+".wq_du.weight").T).reshape(T, nh, hd) * self.w(p+".q_l2_clip.scale").float(), cfg["qk_l2_clip_threshold"]) * tau
     k, v = xk @ self.w(p+".wk_dv.weight").T, xv @ self.w(p+".wv_dv.weight").T
     if full: k, v = self.dynamic_sconv(k, xk, p+".k_sconv", nkv, cache, "ks"), self.dynamic_sconv(v, xv, p+".v_sconv", nkv, cache, "vs")
@@ -106,18 +126,21 @@ class Inkling2:
     # hidden state conditioned relative position bias over backward distances [0, rel_extent)
     rel_extent = cfg["rel_extent"] if full else cfg["sliding_window_size"]
     rel = l2clip((xq @ self.w(p+".wr_du.weight").T).reshape(T, nh, -1) * self.w(p+".rel_l2_clip.scale").float(), cfg["rel_l2_clip_threshold"]) * tau
-    rel_logits = (rel @ self.w(p+".rel_logits_proj.proj").float()).permute(1, 0, 2)  # (nh, T, rel_extent)
+    rel_logits = (rel @ self.w(p+".rel_logits_proj.proj").float()).permute(1, 0, 2).contiguous()  # (nh, T, rel_extent)
     dist = pos.reshape(T, 1) - Tensor.arange(S).reshape(1, S)
     bias = ((dist >= 0) & (dist < rel_extent)).where(rel_logits.gather(-1, dist.clip(0, rel_extent-1).expand(nh, T, S)), 0)
     visible = (dist >= 0) if full else ((dist >= 0) & (dist < cfg["sliding_window_size"]))
 
-    scores = (q.reshape(T, nkv, nh // nkv, hd).permute(1, 2, 0, 3) @ keys.unsqueeze(1).transpose(-1, -2)).reshape(nh, T, S) * hd**-0.5
-    scores = visible.where(scores + bias, -math.inf)
-    # per token attention sink: one extra logit with a zero value
-    scores = scores.cat((xq @ self.w(p+".attn_sink_proj.weight").T).T.reshape(nh, T, 1), dim=-1).softmax(-1)[..., :S]
+    scores = (q.contiguous().reshape(T, nkv, nh // nkv, hd).permute(1, 2, 0, 3) @ keys.unsqueeze(1).transpose(-1, -2)).reshape(nh, T, S) * hd**-0.5
+    scores = visible.where(scores + bias, -math.inf).contiguous()
+    # per token attention sink: one extra logit with a zero value, it only adds to the softmax denominator
+    sink = (xq @ self.w(p+".attn_sink_proj.weight").T).T.reshape(nh, T, 1).contiguous()
+    m = scores.max(-1, keepdim=True).maximum(sink)
+    scores = (scores - m).exp()
+    scores = (scores / (scores.sum(-1, keepdim=True) + (sink - m).exp())).contiguous()
     out = (scores.reshape(nkv, nh // nkv, T, S) @ values.unsqueeze(1)).reshape(nh, T, hd).permute(1, 0, 2).reshape(T, nh * hd)
-    out = out * (xq @ self.w(p+".gate_attn.weight").T).sigmoid()
-    return out @ self.w(p+".wo_ud.weight").T
+    out = out.contiguous() * (xq @ self.w(p+".gate_attn.weight").T).sigmoid().contiguous()
+    return out.contiguous() @ self.w(p+".wo_ud.weight").T
 
   def moe(self, i:int, x:Tensor) -> Tensor:
     cfg, T, k = self.cfg, x.shape[0], self.cfg["num_experts_per_tok"]
@@ -125,12 +148,12 @@ class Inkling2:
     sel = (scores + self.w(f"layers.{i}.mlp.gate.bias")).topk(k)[1]
     probs = scores.gather(-1, sel)
     probs = probs / (probs.sum(-1, keepdim=True) + 1e-20) * cfg["route_scale"]
-    sel = sel.flatten()
-    xs = x.unsqueeze(1).expand(T, k, self.H).reshape(T * k, 1, self.H)
-    gate_up = (xs @ dequant(self.experts[(i, "w13")], sel).transpose(-1, -2)).reshape(T * k, -1, 2)  # rows interleave gate, up
+    sel, split = sel.flatten(), T == 1
+    xs = x.unsqueeze(1).expand(T, k, self.H).reshape(T * k, self.H)
+    gate_up = matvec(xs, dequant(self.experts[(i, "w13")], sel), split).reshape(T * k, -1, 2)  # rows interleave gate, up
     gate, up = gate_up[..., 0], gate_up[..., 1]
     act = softcap(gate, cfg["mlp_gate_softcap"]) * gate.sigmoid() * softcap(up, cfg["mlp_up_softcap"])
-    out = (act.unsqueeze(1) @ dequant(self.experts[(i, "w2")], sel).transpose(-1, -2)).reshape(T, k, self.H)
+    out = matvec(act, dequant(self.experts[(i, "w2")], sel), split).reshape(T, k, self.H)
     return (out * probs.unsqueeze(-1)).sum(1)
 
   def get_cache(self, i:int, app:int) -> dict:
