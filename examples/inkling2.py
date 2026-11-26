@@ -3,6 +3,7 @@
 # port of transformers/models/inkling2_loop/modeling_inkling2_loop.py that runs the original NVFP4/MXFP8 checkpoint without unpacking it
 # 24 layers in 4 blocks of 6, blocks 2 and 3 (layers 6-17) run 3 times, attention residuals across blocks, 128 experts with 8 active
 import json, math, time, argparse
+from typing import Iterator
 from pathlib import Path
 from tinygrad import Tensor, TinyJit, Variable, dtypes, Device, GlobalCounters
 from tinygrad.nn.state import safe_load
@@ -70,8 +71,29 @@ class Inkling2:
     n_loop = self.loop_end - self.loop_start
     qs, kvs = (weights[f"model.llm.middle_cycle_cross_pass_{n}"].float().reshape(n_loop, 2, self.H) for n in ("queries", "kv_queries"))
     self.message_queries = Tensor.stack(qs[:, 0], kvs[:, 0], kvs[:, 1], qs[:, 1], dim=1)  # (n_loop, 4: q k v mlp, H)
-    self.caches: dict[int, dict[str, Tensor]] = {}
-    self.decode_jit = TinyJit(self.forward)
+    # sliding layers keep their keys and values in a ring big enough for the window plus a prefill chunk, full layers keep max_context
+    self.chunks, self.ring = (128, 32, 1), 2048
+    assert self.ring >= cfg["sliding_window_size"] + max(self.chunks) and self.ring % max(self.chunks) == 0
+    self.app_layers = [*range(self.loop_start), *list(range(self.loop_start, self.loop_end)) * self.passes, *range(self.loop_end, self.n_layers)]
+    self.caches = [self.new_cache(i) for i in self.app_layers]
+    self.jits: dict[int, TinyJit] = {}
+
+  def new_cache(self, i:int) -> dict[str, Tensor]:
+    cfg, full = self.cfg, i not in self.local
+    n_kv, hd = (cfg["num_key_value_heads"], cfg["head_dim"]) if full else (cfg["swa_num_key_value_heads"], cfg["swa_head_dim"])
+    zeros = lambda *shape, dtype=dtypes.float: Tensor.zeros(*shape, dtype=dtype).contiguous().realize()
+    # kpos is the position held by each key slot, empty slots are far in the future so they are never visible
+    return {"ks": zeros(self.K-1, n_kv * hd), "vs": zeros(self.K-1, n_kv * hd), "attn": zeros(self.K-1, self.H), "mlp": zeros(self.K-1, self.H),
+            "kv": zeros(2, self.max_context if full else self.ring, n_kv, hd, dtype=self.cache_dtype),
+            "kpos": Tensor.full((self.max_context if full else self.ring,), 1 << 30, dtype=dtypes.int32).contiguous().realize()}
+
+  # the short convolution states can't be rewound like the keys and values, so they are saved where a prompt may be continued from
+  def conv_states(self) -> list[Tensor]: return [c[k] for c in self.caches for k in ("ks", "vs", "attn", "mlp")]
+  def snapshot(self) -> list[Tensor]: return [t.clone().realize() for t in self.conv_states()]
+  def restore(self, snap:list[Tensor]|None=None):
+    """restore a snapshot, or reset to the start of a sequence. keys and values past the restored position are masked or overwritten"""
+    states = self.conv_states()
+    Tensor.realize(*[t.assign(s if snap is not None else t.zeros_like()) for t, s in zip(states, snap or states)])
 
   def w(self, name:str) -> Tensor: return self.W["model.llm." + name]
 
@@ -104,7 +126,7 @@ class Inkling2:
     cache[key].assign(ctx[-(K-1):])
     return (out + x) / math.sqrt(2 * K + 1)
 
-  def attention(self, i:int, xq:Tensor, xk:Tensor, xv:Tensor, cache:dict, start_pos, pos:Tensor) -> Tensor:
+  def attention(self, i:int, xq:Tensor, xk:Tensor, xv:Tensor, cache:dict, start_pos, ring_pos, pos:Tensor) -> Tensor:
     cfg, p, full, T = self.cfg, f"layers.{i}.attn", i not in self.local, xq.shape[0]
     nh, nkv, hd = (cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]) if full else \
                   (cfg["swa_num_attention_heads"], cfg["swa_num_key_value_heads"], cfg["swa_head_dim"])
@@ -119,15 +141,17 @@ class Inkling2:
     else: k, v = self.sconv(k, self.w(p+".k_sconv.weight"), cache, "ks"), self.sconv(v, self.w(p+".v_sconv.weight"), cache, "vs")
     k, v = l2clip(k.reshape(T, nkv, hd), cfg["qk_l2_clip_threshold"]), rms(v.reshape(T, nkv, hd), cfg["rms_norm_eps"])
 
-    cache["kv"][:, start_pos:start_pos+T].assign(Tensor.stack(k, v).cast(cache["kv"].dtype))
-    S = start_pos + T if isinstance(start_pos, int) else self.max_context
-    keys, values = (cache["kv"][j, :S].float().permute(1, 0, 2) for j in range(2))  # (nkv, S, hd)
+    slot = start_pos if full else ring_pos  # chunks start at a multiple of their size, so they never wrap around the ring
+    cache["kv"][:, slot:slot+T].assign(Tensor.stack(k, v).cast(cache["kv"].dtype))
+    cache["kpos"][slot:slot+T].assign(pos)
+    keys, values = (cache["kv"][j].float().permute(1, 0, 2) for j in range(2))  # (nkv, S, hd)
+    S = keys.shape[1]
 
     # hidden state conditioned relative position bias over backward distances [0, rel_extent)
     rel_extent = cfg["rel_extent"] if full else cfg["sliding_window_size"]
     rel = l2clip((xq @ self.w(p+".wr_du.weight").T).reshape(T, nh, -1) * self.w(p+".rel_l2_clip.scale").float(), cfg["rel_l2_clip_threshold"]) * tau
     rel_logits = (rel @ self.w(p+".rel_logits_proj.proj").float()).permute(1, 0, 2).contiguous()  # (nh, T, rel_extent)
-    dist = pos.reshape(T, 1) - Tensor.arange(S).reshape(1, S)
+    dist = pos.reshape(T, 1) - cache["kpos"].reshape(1, S)
     bias = ((dist >= 0) & (dist < rel_extent)).where(rel_logits.gather(-1, dist.clip(0, rel_extent-1).expand(nh, T, S)), 0)
     visible = (dist >= 0) if full else ((dist >= 0) & (dist < cfg["sliding_window_size"]))
 
@@ -156,18 +180,9 @@ class Inkling2:
     out = matvec(act, dequant(self.experts[(i, "w2")], sel), split).reshape(T, k, self.H)
     return (out * probs.unsqueeze(-1)).sum(1)
 
-  def get_cache(self, i:int, app:int) -> dict:
-    if app not in self.caches:
-      cfg, full = self.cfg, i not in self.local
-      kv_dim = cfg["num_key_value_heads" if full else "swa_num_key_value_heads"] * cfg["head_dim" if full else "swa_head_dim"]
-      self.caches[app] = {"ks": Tensor.zeros(self.K-1, kv_dim).contiguous().realize(), "vs": Tensor.zeros(self.K-1, kv_dim).contiguous().realize(),
-                          "attn": Tensor.zeros(self.K-1, self.H).contiguous().realize(), "mlp": Tensor.zeros(self.K-1, self.H).contiguous().realize(),
-                          "kv": Tensor.zeros(2, self.max_context, kv_dim // cfg["head_dim"], cfg["head_dim"], dtype=self.cache_dtype).contiguous().realize()}
-    return self.caches[app]
-
-  def layer(self, i:int, h:Tensor, blocks:list[Tensor], msgs:Tensor|None, app:int, start_pos, pos:Tensor) -> Tensor:
+  def layer(self, i:int, h:Tensor, blocks:list[Tensor], msgs:Tensor|None, app:int, start_pos, ring_pos, pos:Tensor) -> Tensor:
     """decoder layer i as the app-th layer application. msgs holds the (q, k, v, mlp) messages from the previous pass of the loop"""
-    full, cache, eps, L = i not in self.local, self.get_cache(i, app), self.cfg["rms_norm_eps"], f"layers.{i}"
+    full, cache, eps, L = i not in self.local, self.caches[app], self.cfg["rms_norm_eps"], f"layers.{i}"
     norm = lambda x, name: rms(x, eps) * self.w(f"{L}.{name}.weight").float()
     gates = [f"{L}.controllers.{n}" for n in ("attn", "k", "v", "mlp")]
     if full:
@@ -179,7 +194,7 @@ class Inkling2:
       x = self.attn_res(blocks, h, self.w(f"attn_res.attn_queries.{i-1}"))[:, 0] if i > 0 else h
       if msgs is None: xq = xk = xv = norm(x, "attn_norm")
       else: xq, xk, xv = (norm(self.message_gate(g, x, msgs[:, j]), "attn_norm") for j, g in enumerate(gates[:3]))
-    a = self.sconv(self.attention(i, xq, xk, xv, cache, start_pos, pos), self.w(f"{L}.attn_sconv.weight"), cache, "attn")
+    a = self.sconv(self.attention(i, xq, xk, xv, cache, start_pos, ring_pos, pos), self.w(f"{L}.attn_sconv.weight"), cache, "attn")
     # at a block boundary the layer input becomes a block state and the residual stream restarts
     if i % self.block == 0: blocks, residual = blocks + [h], a
     else: residual = h + a
@@ -187,12 +202,12 @@ class Inkling2:
     if msgs is not None: x = self.message_gate(gates[3], x, msgs[:, 3])
     return residual + self.sconv(self.moe(i, norm(x, "mlp_norm")), self.w(f"{L}.mlp_sconv.weight"), cache, "mlp")
 
-  def forward(self, tokens:Tensor, start_pos, pos:Tensor) -> Tensor:
-    """tokens (T,) at positions pos (T,) starting at start_pos. returns the softcapped logits of the last token"""
+  def forward(self, tokens:Tensor, start_pos, ring_pos, pos:Tensor) -> Tensor:
+    """tokens (T,) at positions pos (T,) starting at start_pos (ring_pos in the ring). returns the softcapped logits of the last token"""
     h = rms(self.w("embed.weight")[tokens].float(), self.cfg["rms_norm_eps"]) * self.w("embed_norm.weight").float()
     blocks: list[Tensor] = []
     def run(i, h, msgs, app):
-      out = self.layer(i, h, blocks, msgs, app, start_pos, pos)
+      out = self.layer(i, h, blocks, msgs, app, start_pos, ring_pos, pos)
       if i % self.block == 0: blocks.append(h)
       return out
     ls, le = self.loop_start, self.loop_end
@@ -211,14 +226,29 @@ class Inkling2:
     h = rms(self.attn_res(blocks, h, self.w("attn_res.output_query"))[:, 0], self.cfg["rms_norm_eps"]) * self.w("norm.weight").float()
     logits = h[-1:] @ self.w("unembed.weight")[:self.cfg["unpadded_vocab_size"]].T
     logits = softcap(logits, self.cfg["final_logit_softcapping"])[0]
-    Tensor.realize(logits, *[t for c in self.caches.values() for t in c.values()])
+    Tensor.realize(logits, *[t for c in self.caches for t in c.values()])
     return logits
 
   def __call__(self, tokens:list[int], start_pos:int) -> Tensor:
-    pos = Tensor(list(range(start_pos, start_pos + len(tokens))), dtype=dtypes.int32)
-    if len(tokens) == 1 and start_pos > 0:
-      return self.decode_jit(Tensor(tokens, dtype=dtypes.int32).contiguous().realize(), Variable("start_pos", 1, self.max_context-1).bind(start_pos), pos.realize())
-    return self.forward(Tensor(tokens, dtype=dtypes.int32), start_pos, pos)
+    """runs tokens at start_pos (a sequence starting at 0 needs restore() first) and returns the logits after the last one"""
+    for logits in self.run_chunks(tokens, start_pos): pass
+    return logits
+
+  def run_chunks(self, tokens:list[int], start_pos:int) -> Iterator[Tensor]:
+    """like __call__, yielding the logits after each chunk so a caller can do something between them"""
+    assert 0 < len(tokens) and start_pos + len(tokens) <= self.max_context, f"{start_pos}+{len(tokens)} doesn't fit in {self.max_context}"
+    # fixed size chunks, each starting at a multiple of its size, so every shape is compiled once and jitted
+    i = 0
+    while i < len(tokens):
+      p = start_pos + i
+      T = next(t for t in self.chunks if p % t == 0 and len(tokens) - i >= t)
+      if T not in self.jits: self.jits[T] = TinyJit(self.forward)
+      logits = self.jits[T](Tensor(tokens[i:i+T], dtype=dtypes.int32).realize(), Variable("start_pos", 0, self.max_context-1).bind(p),
+                            Variable("ring_pos", 0, self.ring-1).bind(p % self.ring), Tensor(list(range(p, p+T)), dtype=dtypes.int32).realize())
+      # without a sync, a long prompt queues more GPU work than the device's wait timeout and the next sync reports a hang
+      Device[logits.device].synchronize()
+      i += T
+      yield logits
 
 def load(model_dir:Path, max_context:int, device:str=Device.DEFAULT) -> Inkling2:
   cfg = json.loads((model_dir / "config.json").read_text())
