@@ -2,7 +2,7 @@
 import unittest, pickle, functools, math
 import z3
 
-from tinygrad.dtype import dtypes, ConstType, DType, Invalid
+from tinygrad.dtype import dtypes, ConstType, DType, Invalid, truncate
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, graph_rewrite, sym_infer
 from tinygrad.uop.spec import spec_shared, type_verify
 from tinygrad.uop.symbolic import sym, symbolic, commutative, pm_simplify_valid, pm_move_where_on_load, symbolic_simple
@@ -360,6 +360,15 @@ class TestSymbolic(unittest.TestCase):
 
   def test_mul_mul(self):
     self.helper_test_variable((Variable("a", 0, 5)*10)*9, 0, 5*10*9, "(a*90)")
+
+  def test_float_mul_mul(self):
+    a = Variable("a", 0, 5).cast(dtypes.float)
+    self.assertEqual(graph_rewrite((a*2.0)*3.0, symbolic).render(), "((f32)(a)*6.0)")
+    # folding into a float constant that overflows to inf or flushes to zero changes the result
+    for dt, c1, c2 in ((dtypes.float, 2.0**120, 2.0**10), (dtypes.float, 2.0**-100, 2.0**-100), (dtypes.half, 256.0, 512.0)):
+      x = Variable("a", 0, 5).cast(dt)
+      consts = [truncate[dt](u.arg) for u in graph_rewrite((x*c1)*c2, symbolic).toposort() if u.op is Ops.CONST]
+      self.assertTrue(all(math.isfinite(c) and c != 0 for c in consts), (dt, consts))
 
   def test_mul_lt(self):
     self.helper_test_variable(Variable("a", 0, 5)*4 < 13, 0, 1, "(a<4)")
