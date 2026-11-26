@@ -29,6 +29,11 @@ def fold_bitcast(root:UOp, c:UOp) -> UOp|None:
 def fold_const_alu(a:UOp) -> UOp: return a.const_like(exec_alu(a.op, a.dtype, [const_arg(s) for s in a.src]))
 # a fold mints a signed const only if it fits, the mint would wrap it. unsigned ring ops wrap by definition
 def fits(x:UOp, v:PyConst) -> bool: return x.dtype not in dtypes.sints or x.dtype.min <= v <= x.dtype.max
+def folds_safely(x:UOp, op:Ops, c1:UOp, c2:UOp) -> bool:
+  # (x op c1) op c2 -> x op (c1 op c2) must not overflow signed ints, or turn float constants into inf or (for MUL) flush them to zero
+  if not dtypes.is_float(x.dtype): return fits(x, exec_alu(op, dtypes.weakint, [c1.vmin, c2.vmin]))
+  v = exec_alu(op, x.dtype, [c1.arg, c2.arg])
+  return not (math.isinf(v) and math.isfinite(c1.arg) and math.isfinite(c2.arg)) and not (op is Ops.MUL and v == 0 and c1.arg != 0 and c2.arg != 0)
 # a rewrite that introduces a signed intermediate must keep its range in the dtype, overflow is UB
 def no_overflow(u:UOp) -> bool: return fits(u, u.vmin) and fits(u, u.vmax)
 
@@ -168,7 +173,7 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
    if (dt:=promo_dtype(a.src)) not in dtypes.weaks else None),
   # ** two stage ALU folding **
   *((UPat.var("x", dtypes.wints if op is Ops.ADD else None).alu(op, UPat.cvar("c1")).alu(op, UPat.cvar("c2")).named("f"),
-     lambda f,x,c1,c2: x.alu(f.op,c1.alu(f.op,c2)) if fits(x, exec_alu(f.op, dtypes.weakint, [c1.vmin, c2.vmin])) else None)
+     lambda f,x,c1,c2: x.alu(f.op,c1.alu(f.op,c2)) if folds_safely(x, f.op, c1, c2) else None)
     for op in GroupOp.Associative),
   # bool MUL is AND, ADD/MAX is OR. prevents other rules to rewrite bool ADD/MUL incorrectly
   (UPat.var('x', dtype=dtypes.bool) * UPat.var('y', dtype=dtypes.bool), lambda x,y: x&y),
