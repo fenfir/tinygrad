@@ -1,7 +1,7 @@
-import unittest, gc, struct, ctypes, threading, numpy as np
+import unittest, gc, struct, ctypes, threading, time, numpy as np
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
-from tinygrad.device import Buffer
+from tinygrad.device import Buffer, Compiled
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops, UOp, uopfunc, KernelInfo
@@ -40,6 +40,18 @@ class TestHCQ2Schedule(unittest.TestCase):
     before = len(compile_cache)
     for i, (a, b) in enumerate(ins[3:], 3): self.assertEqual(f(a, b).tolist(), [i * 3.0] * 23)
     self.assertEqual(len(compile_cache), before)
+
+  @patch.object(Compiled, "wait_timeout_ms", 3000.0) # the fence timeout is compiled into the graph, a stall shows up as a 3 s replay
+  def test_jit_replay_while_previous_runs(self):
+    # every replay is submitted while the previous one still runs on the device (the fence orders them). each must finish
+    x = Tensor.empty(64*1024*1024).contiguous().realize()
+    f = TinyJit(lambda x: (x * 1.0001 + 1).realize())
+    tl = Device[Device.DEFAULT].timeline.host.view(fmt='Q')
+    for i in range(500):
+      st = time.perf_counter()
+      f(x)
+      self.assertLess(time.perf_counter() - st, 1.0, f"replay {i} fenced on a previous run that never finished, timeline {tl[0]} of {tl[1]}")
+    Device[Device.DEFAULT].synchronize()
 
   def test_jit_symbolic(self):
     @TinyJit
